@@ -30,20 +30,25 @@ huggingface-cli login
 ```
 
 
-## 📊 Experiment Tracking
-We integrate [Weights & Biases](https://wandb.ai/) for logging:  
+## 📊 Experiment 
+CrossDocked 2020 experiment script
 
-```bash
-wandb login
+```
+bash run_CD.sh
 ```
 
-Each experiment run automatically tracks:
-- Docking scores (Vina/smina)  
-- Drug-likeness (QED)  
-- Synthetic accessibility (SA)  
-- Success rate and optimization curves  
+DrugGen experiment script
 
----
+```
+bash run_DG.sh
+```
+
+#Evaluation
+Modify the output folder name in evaluate.py and simply run it.
+It will provide the representatives and statistic report
+```
+python evaluate.py
+```
 
 ## 📚 Citation
 If you use CadreAI in your research, please cite:
