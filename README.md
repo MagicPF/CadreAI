@@ -31,6 +31,8 @@ huggingface-cli login
 
 
 ## 📊 Experiment 
+For both CrosDocked2020 and DrugGen, we already upload the PDB_ID list in datasets folder.
+
 CrossDocked 2020 experiment script
 
 ```
@@ -43,7 +45,7 @@ DrugGen experiment script
 bash run_DG.sh
 ```
 
-#Evaluation
+## 🔍 Evaluation
 Modify the output folder name in evaluate.py and simply run it.
 It will provide the representatives and statistic report
 ```
