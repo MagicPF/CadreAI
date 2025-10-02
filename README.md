@@ -20,10 +20,11 @@ pip install --upgrade huggingface_hub
 pip install vina meeko
 pip install biopython
 pip install openai
-
-# Additional chemistry tools
 conda install -c conda-forge openbabel -y
 conda install -c bioconda smina -y
+pip install seaborn
+pip install ollama
+pip install loguru
 
 # Authenticate HuggingFace (for model checkpoints)
 huggingface-cli login
