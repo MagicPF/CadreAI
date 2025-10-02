@@ -5,7 +5,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
-from DrugVoyager3 import DrugVoyager
+from CadreAI import CadreAI
 from DrugExpert import DrugExpert
 from utils import get_protein_sequence_from_pdb
 from Bio.PDB import PDBParser, PPBuilder
@@ -15,9 +15,9 @@ default_error_lock = threading.Lock()
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="DrugVoyager Experiment on DrugGen dataset")
+    parser = argparse.ArgumentParser(description="CadreAI Experiment on DrugGen dataset")
     parser.add_argument("--commander_model", type=str, default="deepseek-V3",
-                        help="The Commander model to use for DrugVoyager")
+                        help="The Commander model to use for CadreAI")
     return parser.parse_args()
 
 
@@ -72,7 +72,7 @@ def process_pdb(row, row_num, input_csv, output_dir, cache_dir, locks_dir,
 
     try:
         print(f"\n正在处理 {pdb_id}: {protein_title} ({row_num-1})")
-        drug_voyager = DrugVoyager(
+        drug_voyager = CadreAI(
             api_key=api_key,
             commander_model=commander_model,
             drug_model_itself=drug_expert,

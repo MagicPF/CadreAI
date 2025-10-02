@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore")
 sys.stdout.reconfigure(encoding='utf-8')
 
 
-class DrugVoyager:
+class CadreAI:
     def __init__(
         self,
         api_key="EMPTY",
@@ -37,7 +37,7 @@ class DrugVoyager:
         need_save_each_step=False
     ):
         # wandb.init(
-        #     project="DrugVoyager", name="drug_discovery_with_deepseek_commander",
+        #     project="CadreAI", name="drug_discovery_with_deepseek_commander",
         #     config={"device": device, "max_iterations": max_iterations}
         # )
 
@@ -437,7 +437,7 @@ class DrugVoyager:
 
 import tempfile
 
-class DrugVoyagerPro:
+class CadreAIPro:
     def __init__(
         self,
         api_key="EMPTY",
@@ -456,7 +456,7 @@ class DrugVoyagerPro:
         need_save_each_step=False
     ):
         # wandb.init(
-        #     project="DrugVoyager", name="drug_discovery_with_deepseek_commander",
+        #     project="CadreAI", name="drug_discovery_with_deepseek_commander",
         #     config={"device": device, "max_iterations": max_iterations}
         # )
 

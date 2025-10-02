@@ -32,7 +32,7 @@ def print_progress_bar(current, total, length=50):
 
 def main():
     parser = argparse.ArgumentParser(description="实时监测输出文件夹进度")
-    parser.add_argument("output_dir", help="DrugVoyager 输出目录")
+    parser.add_argument("output_dir", help="CadreAI 输出目录")
     parser.add_argument("--interval", type=int, default=1,
                         help="刷新间隔，单位秒（默认5s）")
     args = parser.parse_args()
