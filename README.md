@@ -34,17 +34,22 @@ huggingface-cli login
 ## 📊 Experiment 
 For both CrosDocked2020 and DrugGen, we already upload the PDB_ID list in datasets folder.
 
-CrossDocked 2020 experiment script
+CrossDocked 2020 
+please run the datasets/CrossDocked2020/test/get_list.py to get the PDB file first and then run the  experiment script
 
 ```
 bash run_CD.sh
 ```
 
-DrugGen experiment script
+DrugGen
+
+Direct run experiment script
 
 ```
 bash run_DG.sh
 ```
+
+the PDB file will be downloaded automatically.
 
 ## 🔍 Evaluation
 Modify the output folder name in evaluate.py and simply run it.
