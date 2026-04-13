@@ -1,4 +1,14 @@
 # CadreAI
+
+## ⚙️ API Key for trial
+
+For convenicence, you can use following key for deepseek:
+```
+sk-c5be009fb51246b69d73681014d1c6cb
+```
+I have paid 300 CNY of token for it, you can use it for trial.
+
+
 ## ⚙️ Installation
 
 We recommend using **conda** to manage dependencies.
