@@ -1,18 +1,4 @@
 # CadreAI
-
-## ⚙️ For review API
-
-Dear reviewers,
-
-For your convenicence, you can use following key for deepseek:
-```
-sk-c5be009fb51246b69d73681014d1c6cb
-```
-I have paid 300 CNY of token for it, you can use it for review.
-
-Best Regards,
-Feng Pan
-
 ## ⚙️ Installation
 
 We recommend using **conda** to manage dependencies.
