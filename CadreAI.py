@@ -60,7 +60,7 @@ class CadreAI:
             need_cache=False
         )
         # 使用官方 DeepSeek 实例
-        self.commander = Deepseek_official(key="sk-35965cbdd484474bb51cb8d30e6655c3", cache_dir=os.path.join(cache_dir, "jsons/"))
+        self.commander = Deepseek_official(key="sk-c5be009fb51246b69d73681014d1c6cb", cache_dir=os.path.join(cache_dir, "jsons/"))
         self.max_iterations = max_iterations
         self.skill_lib_file = cache_dir + skill_lib_file
         self.history_log_file = cache_dir + history_log_file
