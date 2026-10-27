@@ -1,361 +1,283 @@
+"""ELILLM CrossDocked2020 smina simulator.
+
+Uses the EXACT benchmark receptor/reference pair from
+  datasets/crossdocked/structure-files-test/{index}-protein.pdb
+  datasets/crossdocked/structure-files-test/{index}-ligand.sdf
+
+The docking and ligand-preparation parameters follow ELILLM/tools/docking.py.
+Error handling and subprocess execution intentionally use safer semantics.
+"""
+
+import argparse
+import hashlib
+import json
+import logging
+import math
 import os
+from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
-import yaml
-import json
-import sys
-import wandb
+import threading
+from typing import Optional, Union
+
+import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem
-from meeko import MoleculePreparation
-from vina import Vina
-import requests
-sys.stdout.reconfigure(encoding='utf-8')
-from pdb import set_trace as st
-import time
 
-from meeko import MoleculePreparation
-from rdkit import Chem
+SMINA_BINARY = "smina"
+CROSSDOCKED_DIR = Path("datasets/crossdocked/structure-files-test")
+# SMINA_AUTOBOX_ADD = 6
+SMINA_AUTOBOX_ADD = 6
+SMINA_SEED = 1234
+SMINA_EXHAUSTIVENESS = 9
+SMINA_CPU = 4
+SMINA_TIMEOUT = 1800
+EMBED_SEED = 1
+FAILED_AFFINITY = 500.0
+LOGGER = logging.getLogger(__name__)
+
+PathLike = Union[str, os.PathLike]
+_SCORE_ROW = re.compile(
+    r"\s*(\d+)\s+([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s+"
+    r"([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s+"
+    r"([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*"
+)
 
 
-import subprocess
+def _mode_one_score(stdout: str) -> float:
+    scores = []
+    for line in stdout.splitlines():
+        match = _SCORE_ROW.fullmatch(line)
+        if match and int(match.group(1)) == 1:
+            scores.append(float(match.group(2)))
+    if len(scores) != 1:
+        raise ValueError(f"Expected one smina mode-1 affinity, got {len(scores)}.\n{stdout[-3000:]}")
+    return scores[0]
 
-def convert_pdb_to_pdbqt_with_obabel(pdb_path, pdbqt_path):
-    # print("start convert with Open Babel")
-    try:
-        result = subprocess.run(
-            ["obabel", "-ipdb", pdb_path, "-opdbqt", "-O", pdbqt_path, "-xr"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-            text=True
-        )
-        # print("✅ Open Babel 输出信息：")
-        # print(result.stdout)
-        # print(result.stderr)
 
-    except subprocess.CalledProcessError as e:
-        # print("❌ Open Babel 转换失败（可能是 kekulize 问题）")
-        # print("stderr:\n", e.stderr)
-        # 返回一个标志值或直接 raise/return None 取决于你想怎么处理
-        return False
+def _prepare_ligand(smiles: str, path: Path) -> None:
+    mol = Chem.MolFromSmiles(smiles)
+    assert mol is not None, f"Invalid SMILES: {smiles!r}"
+    mol = Chem.AddHs(mol)
+    params = AllChem.ETKDGv3()
+    params.randomSeed = EMBED_SEED
+    status = AllChem.EmbedMolecule(mol, params)
+    assert status == 0, f"ETKDGv3 failed for SMILES: {smiles!r}"
+    # Match ELILLM: default MMFF options; no custom convergence threshold.
+    AllChem.MMFFOptimizeMolecule(mol)
+    writer = Chem.SDWriter(str(path))
+    writer.write(mol)
+    writer.close()
+    assert path.is_file() and path.stat().st_size > 0
 
-    # print(f"✅ 转换完成：{pdb_path} -> {pdbqt_path}")
-    return True
+
+def _identity(path: Path) -> dict:
+    stat = path.stat()
+    return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
 class BindingSimulator:
-    def __init__(self, out_dir="boltz_output", use_msa_server=True, accelerator="gpu", cache_file="binding_cache.json", need_cache=False):
-        """
-        Initializes the BindingSimulator with local caching.
-
-        Args:
-            out_dir (str): Directory to save the predictions.
-            use_msa_server (bool): Whether to use the MSA server for multiple sequence alignments.
-            accelerator (str): Which accelerator to use: "gpu", "cpu", or "tpu".
-            cache_file (str): Path to the local cache file.
-            need_cache (bool): Whether to use cache for results.
-        """
-        self.out_dir = out_dir
-        if not os.path.exists(self.out_dir):
-            os.makedirs(self.out_dir, exist_ok=True)
-        self.use_msa_server = use_msa_server
-        self.accelerator = accelerator
+    def __init__(
+        self,
+        out_dir: PathLike = "boltz_output",
+        use_msa_server: bool = True,
+        accelerator: str = "gpu",
+        cache_file: PathLike = "binding_cache.json",
+        need_cache: bool = False,
+        crossdocked_dir: PathLike = CROSSDOCKED_DIR,
+        smina_binary: str = SMINA_BINARY,
+        target_map_file: Optional[PathLike] = None,
+    ):
+        self.out_dir = Path(out_dir).resolve()
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.use_msa_server = use_msa_server  # API compatibility only.
+        self.accelerator = accelerator        # ELILLM smina executes on CPU.
+        self.cache_file = Path(cache_file).resolve()
         self.need_cache = need_cache
-
-        # Load or initialize cache
-        self.cache_file = cache_file
+        self.crossdocked_dir = Path(crossdocked_dir).resolve()
+        self.smina_binary = smina_binary
+        self._cache_lock = threading.Lock()
         self.cache = self._load_cache() if need_cache else {}
+        self.target_map = {}
+        if target_map_file is not None:
+            mapping = json.loads(Path(target_map_file).read_text(encoding="utf-8"))
+            assert isinstance(mapping, dict), "Target mapping must be a JSON object"
+            self.target_map = {str(k): str(v) for k, v in mapping.items()}
 
-    def _load_cache(self):
-        """Loads the cache from a file if it exists."""
-        if os.path.exists(self.cache_file):
-            with open(self.cache_file, "r") as f:
-                return json.load(f)
-        return {}
+    def _load_cache(self) -> dict:
+        if not self.cache_file.exists():
+            return {}
+        value = json.loads(self.cache_file.read_text(encoding="utf-8"))
+        assert isinstance(value, dict), "Cache must be a JSON object"
+        return value
 
-    def _save_cache(self):
-        """Saves the cache to a file if caching is enabled."""
-        if self.need_cache:
-            with open(self.cache_file, "w") as f:
-                json.dump(self.cache, f, indent=4)
+    def _save_cache(self) -> None:
+        self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".binding-cache-", suffix=".json", dir=self.cache_file.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(self.cache, stream, indent=2)
+            os.replace(tmp, self.cache_file)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
 
-    def safe_rmtree(self, path):
-        if os.path.islink(path):
-            os.unlink(path)
-        elif os.path.isdir(path):
-            shutil.rmtree(path)
-        elif os.path.exists(path):
-            os.remove(path)
+    def list_targets(self) -> list[str]:
+        """List only targets with both exact ELILLM reference files."""
+        assert self.crossdocked_dir.is_dir(), f"Missing test structure directory: {self.crossdocked_dir}"
+        proteins = {p.name.removesuffix("-protein.pdb") for p in self.crossdocked_dir.glob("*-protein.pdb")}
+        ligands = {p.name.removesuffix("-ligand.sdf") for p in self.crossdocked_dir.glob("*-ligand.sdf")}
+        return sorted(proteins & ligands, key=lambda s: (not s.isdigit(), int(s) if s.isdigit() else s))
 
-    def _cleanup_output_dir(self):
-        """Deletes the Boltz-1 output directory to prevent interference in future runs."""
-        if os.path.exists(self.out_dir):
-            print(f"🧹 Cleaning up: Removing {self.out_dir} to avoid conflicts in new predictions...")
-            self.safe_rmtree(self.out_dir)
+    def _resolve_inputs(
+        self,
+        pdb_id: str,
+        target_index: Optional[Union[int, str]],
+        receptor_path: Optional[PathLike],
+        reference_ligand_path: Optional[PathLike],
+    ) -> tuple[Path, Path]:
+        if (receptor_path is None) != (reference_ligand_path is None):
+            raise ValueError("Provide both receptor_path and reference_ligand_path, or neither")
+        if receptor_path is not None:
+            receptor = Path(receptor_path).resolve()
+            reference = Path(reference_ligand_path).resolve()
         else:
-            print(f"✅ No cleanup needed: {self.out_dir} does not exist.")
-
-    def predict_binding_vina(self, protein_seq, drug_smiles, output_format="pdb", box_size=20, exhaustiveness=32, pdb_id="NotAvailable"):
-        """
-        Predicts the binding confidence scores and structure using either known PDB structure or Boltz-1 prediction.
-        Uses cache if enabled.
-
-        Args:
-            protein_seq (str): The protein sequence in FASTA format.
-            drug_smiles (str): The drug structure in SMILES format.
-            output_format (str): Output format for the predictions, either "pdb" or "mmcif".
-            pdb_id (str): PDB ID if known, otherwise "NotAvailable".
-        """
-
-        self._cleanup_output_dir()
-        cache_key = f"{protein_seq}_{drug_smiles}"
-
-        if self.need_cache and cache_key in self.cache:
-            return self.cache[cache_key]
-        receptor_pdb_path = None
-        # 处理已知PDB ID的情况
-        if pdb_id != "NotAvailable":
-            protein_db_dir = "protein_DB"
-            os.makedirs(protein_db_dir, exist_ok=True)
-            pdb_file_path = os.path.join(protein_db_dir, f"{pdb_id}.pdb")
-
-            if not os.path.exists(pdb_file_path):
-                url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
-                try:
-                    response = requests.get(url, timeout=10)
-                    response.raise_for_status()
-                    with open(pdb_file_path, 'w') as f:
-                        f.write(response.text)
-                    print(f"已下载原始 PDB 文件：{pdb_file_path}")
-                except requests.exceptions.RequestException as e:
-                    raise ValueError(f"PDB下载失败 {pdb_id}: {str(e)}")
-            receptor_pdb_path = self.out_dir
-        # 使用Boltz-1预测结构
-        else:
-            print("Due to no PDB, use boltz-1 to predict the structure")
-            self.out_dir = os.path.join(self.out_dir, "boltz_output")
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # 创建输入文件
-                input_data = {
-                    'sequences': [
-                        {'protein': {'id': 'A', 'sequence': protein_seq}},
-                        {'ligand': {'id': 'L', 'smiles': drug_smiles}}
-                    ]
-                }
-                input_file = os.path.join(temp_dir, "input.yaml")
-                with open(input_file, 'w') as f:
-                    yaml.dump(input_data, f)
-
-                # 运行Boltz-1预测
-                boltz_command = [
-                    "boltz", "predict", input_file,
-                    "--out_dir", self.out_dir,
-                    "--accelerator", self.accelerator,
-                    "--output_format", output_format
-                ]
-                if self.use_msa_server:
-                    boltz_command.append("--use_msa_server")
-
-                subprocess.run(boltz_command, check=True)
-                receptor_pdb_path = os.path.join(
-                    self.out_dir, "boltz_results_input", 
-                    "predictions", "input", "input_model_0.pdb"
+            if target_index is not None:
+                target = str(target_index)
+            elif str(pdb_id) in self.target_map:
+                target = self.target_map[str(pdb_id)]
+            elif str(pdb_id).isdigit():
+                target = str(pdb_id)
+            else:
+                raise ValueError(
+                    f"Cannot map DrugVoyager target {pdb_id!r} to an ELILLM test index. "
+                    "Pass target_index=..., set target_map_file, or provide both exact structure paths. "
+                    "PDB IDs and ELILLM numeric indices are not interchangeable."
                 )
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", target):
+                raise ValueError(f"Unsafe test-set target identifier: {target!r}")
+            receptor = self.crossdocked_dir / f"{target}-protein.pdb"
+            reference = self.crossdocked_dir / f"{target}-ligand.sdf"
+        if not receptor.is_file():
+            raise FileNotFoundError(f"Receptor missing: {receptor}")
+        if not reference.is_file():
+            raise FileNotFoundError(f"Reference ligand missing: {reference}")
+        if receptor.stat().st_size == 0 or reference.stat().st_size == 0:
+            raise ValueError("Receptor/reference ligand file is empty")
+        return receptor.resolve(), reference.resolve()
 
+    def CaculateAffinity(
+        self,
+        protein_seq: str,
+        drug_smiles: str,
+        output_format: str = "pdb",
+        box_size: float = 20,
+        exhaustiveness: int = SMINA_EXHAUSTIVENESS,
+        pdb_id: str = "NotAvailable",
+        reference_ligand_path: Optional[PathLike] = None,
+        receptor_path: Optional[PathLike] = None,
+        chain: Optional[str] = None,
+        autobox_add: float = SMINA_AUTOBOX_ADD,
+        seed: int = SMINA_SEED,
+        cpu: int = SMINA_CPU,
+        target_index: Optional[Union[int, str]] = None,
+        num_smina: int = 1,
+        save_pose: bool = False,
+    ) -> dict:
+        """Evaluate SMILES with the ELILLM CrossDocked reference box.
+
+        Returns {'binding_affinity': float}. Legacy unused arguments are accepted.
+        Any non-default docking parameters deviate from the reference protocol.
+        """
         try:
-        # if True:
-            if not os.path.exists(receptor_pdb_path):
-                os.makedirs(receptor_pdb_path, exist_ok=True)    
-
-            # 记录分子结构
-            # wandb.log({"Binding Structure": wandb.Molecule(open(receptor_pdb_path))})
-
-            # 转换受体格式
-            receptor_pdbqt = os.path.join(receptor_pdb_path, f"receptor.pdbqt")
-            # print(f"=================={receptor_pdbqt}==================")
-            # subprocess.run(
-            #     ["obabel", "-ipdb", pdb_file_path, "-opdbqt", 
-            #      "-O", receptor_pdbqt, "-xr"],
-            #     check=True
-            # )
-            receptor_pdbqt = os.path.join(receptor_pdb_path, "receptor.pdbqt")
-            success = convert_pdb_to_pdbqt_with_obabel(pdb_file_path, receptor_pdbqt)
-            if not success:
-                print("⚠️ 转换失败，跳过该受体或记录日志")
-                return {
-                    "error": "Open Babel 转换失败",
-                    "binding_affinity": None,
-                    "best_pose": None
-                }
-
-            # 准备配体
-            mol = Chem.MolFromSmiles(drug_smiles)
-            if mol is None:
-                raise ValueError("无效的SMILES格式")            
-
-            mol = Chem.AddHs(mol)  # ✅ 添加显式氢原子
-            AllChem.EmbedMolecule(mol, AllChem.ETKDG())
-            AllChem.MMFFOptimizeMolecule(mol)
-            AllChem.ComputeGasteigerCharges(mol)            
-
-            preparator = MoleculePreparation()
-            preparator.prepare(mol)         
-
-            ligand_pdbqt = preparator.write_pdbqt_string()
-
-            # 分子对接
-            v = Vina(sf_name='vina', verbosity=1)
-            v.set_receptor(receptor_pdbqt)
-            v.set_ligand_from_string(ligand_pdbqt)
-
-            # 计算对接盒中心
-            with open(receptor_pdbqt) as f:
-                coords = [
-                    (float(line[30:38]), float(line[38:46]), float(line[46:54]))
-                    for line in f if line.startswith("ATOM")
-                ]
-                center = [sum(c[i] for c in coords)/len(coords) for i in range(3)]
-
-            v.compute_vina_maps(center=center, box_size=[box_size]*3)
-            v.dock(
-                exhaustiveness=exhaustiveness,
-                n_poses=1,
-                min_rmsd=1.0,
-                max_evals=10_000_000
+            del protein_seq, output_format, box_size, chain
+            assert isinstance(drug_smiles, str) and drug_smiles.strip(), "Empty SMILES"
+            assert int(num_smina) >= 1
+            # assert int(cpu) >= 1 and int(exhaustiveness) >= 1 and float(autobox_add) >= 0
+            executable = shutil.which(self.smina_binary)
+            if executable is None:
+                raise FileNotFoundError(f"smina not found: {self.smina_binary}")
+            receptor, reference = self._resolve_inputs(pdb_id, target_index, receptor_path, reference_ligand_path)
+            payload = {
+                "protocol": "ELILLM-crossdocked-2020-v2", "smiles": drug_smiles,
+                "receptor": _identity(receptor), "reference": _identity(reference),
+                "autobox_add": float(autobox_add), "seed": int(seed),
+                "exhaustiveness": int(exhaustiveness), #"cpu": int(cpu),
+                "embed_seed": EMBED_SEED, "num_smina": int(num_smina), "executable": executable,
+            }
+            cache_key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            with self._cache_lock:
+                if self.need_cache and cache_key in self.cache:
+                    return dict(self.cache[cache_key])
+            scores = []
+            for attempt in range(int(num_smina)):
+                with tempfile.TemporaryDirectory(prefix="elillm_smina_", dir=self.out_dir) as tmp:
+                    ligand_path = Path(tmp) / "generated_ligand.sdf"
+                    _prepare_ligand(drug_smiles, ligand_path)
+                    command = [
+                        executable, "-r", str(receptor), "-l", str(ligand_path),
+                        "--autobox_ligand", str(reference),
+                        "--autobox_add", str(autobox_add),
+                        "--seed", str(int(seed)),
+                        "--exhaustiveness", str(int(exhaustiveness)),
+                        # "--cpu", str(int(cpu)),
+                    ]
+                    if save_pose:
+                        pose_path = self.out_dir / f"pose_{cache_key[:16]}_{attempt}.pdb"
+                        command.extend(["-o", str(pose_path)])
+                    completed = subprocess.run(command, text=True, capture_output=True, timeout=SMINA_TIMEOUT)
+                    if completed.returncode != 0:
+                        raise RuntimeError(
+                            f"smina failed (code {completed.returncode})\n"
+                            f"Command: {' '.join(command)}\n"
+                            f"stdout: {completed.stdout[-3000:]}\nstderr: {completed.stderr[-3000:]}"
+                        )
+                    scores.append(_mode_one_score(completed.stdout))
+            affinity = float(np.asarray(scores, dtype=np.float32).mean())
+            if not math.isfinite(affinity):
+                raise ValueError(f"Non-finite docking affinity: {affinity}")
+            output = {"binding_affinity": affinity}
+            print("****************************************************")
+            print(f"Current Molecule Affinity:{affinity}")
+            print("****************************************************")
+            if self.need_cache:
+                with self._cache_lock:
+                    self.cache[cache_key] = output
+                    self._save_cache()
+            return output
+        except (ValueError, RuntimeError, OSError, AssertionError,
+                subprocess.SubprocessError, IndexError, TypeError) as exc:
+            LOGGER.warning(
+                "[Smina Failed] pdb_id=%s target_index=%s: %s: %s; affinity=%.1f",
+                pdb_id, target_index, type(exc).__name__, str(exc)[-1200:], FAILED_AFFINITY,
             )
+            return {"binding_affinity": FAILED_AFFINITY, "error": str(exc)[-1200:]}
 
-            # 保存结果
-            results = {
-                "binding_affinity": v.energies()[0][0],
-                # "best_pose": v.poses(),
-                # "receptor_source": "PDB" if pdb_id != "NotAvailable" else "Boltz-1"
-            }
+    CalculateAffinity = CaculateAffinity
 
-        except Exception as e:
-            print(f"对接失败: {str(e)}")
-            results = {
-                "error": str(e),
-                "binding_affinity": None,
-                "best_pose": None
-            }
 
-        # 缓存结果
-        if self.need_cache:
-            self.cache[cache_key] = results
-
-        return results
-
-    def CaculateAffinity(self, protein_seq, drug_smiles, output_format="pdb", box_size=20, exhaustiveness=9, pdb_id="NotAvailable"):
-        # self._cleanup_output_dir()
-        cache_key = f"{protein_seq}_{drug_smiles}"
-
-        if self.need_cache and cache_key in self.cache:
-            return self.cache[cache_key]
-        from pdb import set_trace
-        
-
-        try:
-            # 1. 下载或预测 PDB
-            if pdb_id != "NotAvailable":
-                pdb_file_path = os.path.join("protein_DB", f"{pdb_id}.pdb")
-                os.makedirs("protein_DB", exist_ok=True)
-                if not os.path.exists(pdb_file_path):
-                    url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
-                    response = requests.get(url, timeout=10)
-                    response.raise_for_status()
-                    with open(pdb_file_path, 'w') as f:
-                        f.write(response.text)
-                    print(f"已下载 PDB 文件: {pdb_file_path}")
-            else:
-                raise ValueError("当前仅支持使用已知 PDB ID 模式 (与 AlphaDrug 一致)")
-            # set_trace()
-            # 2. SMILES 转换为 .pdb 文件
-            mol = Chem.MolFromSmiles(drug_smiles)
-            mol = Chem.AddHs(mol)
-            AllChem.EmbedMolecule(mol)
-            mol = Chem.RemoveHs(mol)
-            ligand_pdb_path = os.path.join(self.out_dir, f"ligand_{time.time():.0f}.pdb")
-            Chem.MolToPDBFile(mol, ligand_pdb_path)
-
-            # 3. 构建 smina 命令
-            output_tmp_path = os.path.join(self.out_dir, f"smina_out_{time.time():.0f}")
-            smina_cmd = [
-                "smina", "-r", pdb_file_path, "-l", ligand_pdb_path,
-                "--autobox_ligand", pdb_file_path,
-                "--autobox_add", "10",
-                "--seed", "1000",
-                "--exhaustiveness", str(exhaustiveness),
-                ">>", output_tmp_path
-            ]
-            smina_cmd_str = " ".join(smina_cmd)
-            # print(f"[Smina Command] {smina_cmd_str}")
-
-            subprocess.run(smina_cmd_str, shell=True, stdout=subprocess.PIPE)
-
-            # 4. 提取 Affinity 分数
-            affinity = 500
-            with open(output_tmp_path, 'r') as f:
-                for line in f:
-                    tokens = line.strip().split()
-                    if len(tokens) == 4 and tokens[0] == '1':
-                        affinity = float(tokens[1])
-                        break
-
-            # 5. 清理临时文件
-            subprocess.run(f'rm -rf {output_tmp_path}', shell=True)
-            subprocess.run(f'rm -rf {ligand_pdb_path}', shell=True)
-
-            if affinity == 500:
-                print("❌ affinity error")
-                results = {"binding_affinity": 500.0}
-                raise ValueError("Affinity extraction failed, please check the output file.")
-            else:
-                results = {
-                    "binding_affinity": affinity
-                }
-            print(results)
-        except Exception as e:
-            print(f"❌ Docking Exception: {e}")
-            results = {
-                "error": str(e)
-            }
-
-        if self.need_cache:
-            self.cache[cache_key] = results
-        return results
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Check ELILLM references or evaluate one SMILES")
+    parser.add_argument("--crossdocked-dir", default=str(CROSSDOCKED_DIR))
+    parser.add_argument("--target-index", help="ELILLM test index, e.g. 0")
+    parser.add_argument("--smiles", help="Run one smina docking calculation (otherwise only verify dataset)")
+    parser.add_argument("--out-dir", default="boltz_output")
+    parser.add_argument("--smina-binary", default=SMINA_BINARY)
+    args = parser.parse_args()
+    simulator = BindingSimulator(out_dir=args.out_dir, crossdocked_dir=args.crossdocked_dir,
+                                 smina_binary=args.smina_binary)
+    targets = simulator.list_targets()
+    print(f"Dataset directory: {simulator.crossdocked_dir}")
+    print(f"Complete receptor/reference pairs: {len(targets)}")
+    print(f"First target IDs: {targets[:12]}")
+    assert targets, "No matching *-protein.pdb / *-ligand.sdf pairs found"
+    if args.smiles is not None:
+        assert args.target_index is not None, "Specify --target-index for docking"
+        result = simulator.CaculateAffinity("", args.smiles, target_index=args.target_index)
+        print(f"Affinity: {result['binding_affinity']:.4f} kcal/mol")
 
 
 if __name__ == "__main__":
-    simulator = BindingSimulator(need_cache=False)  # 关闭缓存用于调试
-
-    protein_sequence = "MKTIIALSYIFCLVFA"  # 示例蛋白质序列
-    drug_smiles = "CC(C)Cc1ccccc1"        # 示例 SMILES 分子
-
-    print("🔬 Predicting binding confidence using Vina docking...")
-    results = simulator.predict_binding(
-        protein_seq=protein_sequence,
-        drug_smiles=drug_smiles,
-        output_format="pdb",
-        box_size=20,
-        exhaustiveness=9,
-        pdb_id="1zys"  # 使用已知 PDB ID，和你 AlphaDrug 保持一致
-    )
-
-    print("📊 Predicted Binding Results:")
-    print(json.dumps(results, indent=4, ensure_ascii=False))    
-
-
-    print("🔬 Predicting binding confidence using smina docking...")
-    results = simulator.CaculateAffinity(
-        protein_seq=protein_sequence,
-        drug_smiles=drug_smiles,
-        output_format="pdb",
-        box_size=20,
-        exhaustiveness=9,
-        pdb_id="1zys"  # 使用已知 PDB ID，和你 AlphaDrug 保持一致
-    )
-
-    print("📊 Predicted Binding Results:")
-    print(json.dumps(results, indent=4, ensure_ascii=False))
+    main()
