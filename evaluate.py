@@ -5,9 +5,9 @@ Reproduces the selection policy of monitor.py, but writes BOTH independent
 Top-1 datasets and a transparent evaluation report. No hit-based prefilter.
 
 Examples:
-    python evaluate.py --root CadreAI_Coupled --output-dir evaluation
-    python evaluate.py --root CadreAI_Coupled --allow-incomplete
-    python evaluate.py --root CadreAI_Coupled --strict-duplicates
+    python evaluate.py --root CadreAI --output-dir evaluation
+    python evaluate.py --root CadreAI --allow-incomplete
+    python evaluate.py --root CadreAI --strict-duplicates
 
 Requires: RDKit. Input columns: SMILES, vina, qed, sa, composite.
 """
@@ -34,7 +34,7 @@ THRESHOLDS = {"vina": -8.18, "qed": 0.25, "sa": 0.59}
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--root", type=Path, default=Path("CadreAI_Coupled"),
+    p.add_argument("--root", type=Path, default=Path("CadreAI"),
                    help="Experiment root containing cache/<task_id>/ and <task_id>/")
     p.add_argument("--output-dir", type=Path, default=Path("evaluation"))
     p.add_argument("--total-targets", type=int, default=100)

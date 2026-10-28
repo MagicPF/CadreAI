@@ -66,10 +66,10 @@ The revised `evaluate.py` implements **unconditional target-level Top-1 selectio
 Run from the repository root:
 
 ```bash
-python evaluate.py --root CadreAI_Coupled --output-dir evaluation
+python evaluate.py --root CadreAI --output-dir evaluation
 ```
 
-Replace `CadreAI_Coupled` with the actual experiment output directory. The evaluator reads the following sources for each numeric target ID `0`–`99`:
+The default experiment root is `CadreAI`; use `--root` to specify another experiment output directory. The evaluator reads the following sources for each numeric target ID `0`–`99`:
 
 ```text
 <root>/<target_id>/molecules.csv
@@ -92,7 +92,7 @@ For additional validation:
 
 ```bash
 python evaluate.py \
-  --root CadreAI_Coupled \
+  --root CadreAI \
   --output-dir evaluation \
   --strict-duplicates \
   --strict-composite
