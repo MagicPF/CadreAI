@@ -1,185 +1,219 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""CrossDocked2020 unconditional target-level Top-1 evaluation.
 
-import pandas as pd
-import os
+Reproduces the selection policy of monitor.py, but writes BOTH independent
+Top-1 datasets and a transparent evaluation report. No hit-based prefilter.
+
+Examples:
+    python evaluate.py --root CadreAI_Coupled --output-dir evaluation
+    python evaluate.py --root CadreAI_Coupled --allow-incomplete
+    python evaluate.py --root CadreAI_Coupled --strict-duplicates
+
+Requires: RDKit. Input columns: SMILES, vina, qed, sa, composite.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import sys
+from collections import Counter
 from pathlib import Path
-from rdkit import Chem
+from statistics import mean, median, stdev
+
+from rdkit import Chem, RDLogger
 from rdkit.Chem import Descriptors
-from rdkit.Chem import Crippen  # LogP
-from rdkit.Chem import Lipinski  # HBD/HBA
 
-# ========= 基础 I/O =========
-def parse_molecules_csv(path):
-    """读取标准 CSV 文件并返回 DataFrame"""
-    return pd.read_csv(path)
+RDLogger.DisableLog("rdApp.error")
+METRICS = ("vina", "qed", "sa", "composite")
+EXPORT_FIELDS = ("task_id", "SMILES", "vina", "qed", "sa", "composite", "mol_weight",
+                 "heavy_atom_count", "ligand_efficiency", "hit", "source_file")
+THRESHOLDS = {"vina": -8.18, "qed": 0.25, "sa": 0.59}
 
-# ========= 分子描述符 & Lipinski =========
-def compute_descriptors(smiles):
-    """
-    根据 SMILES 计算分子量、LogP、氢键供体数、氢键受体数
-    返回: dict 或 None
-    """
-    mol = Chem.MolFromSmiles(smiles)
-    if not mol:
-        return None
-    return {
-        "MolWt": Descriptors.MolWt(mol),
-        "LogP": Crippen.MolLogP(mol),
-        "NumHDonors": Lipinski.NumHDonors(mol),
-        "NumHAcceptors": Lipinski.NumHAcceptors(mol),
-    }
 
-def compute_lipinski_score(desc):
-    """
-    Lipinski 4条规则合规计数:
-    1) MolWt <= 500
-    2) LogP <= 5
-    3) HBD <= 5
-    4) HBA <= 10
-    """
-    if not desc:
-        return None
-    score = 0
-    score += 1 if desc["MolWt"] <= 500 else 0
-    score += 1 if desc["LogP"] <= 5 else 0
-    score += 1 if desc["NumHDonors"] <= 5 else 0
-    score += 1 if desc["NumHAcceptors"] <= 10 else 0
-    return score
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--root", type=Path, default=Path("CadreAI_Coupled"),
+                   help="Experiment root containing cache/<task_id>/ and <task_id>/")
+    p.add_argument("--output-dir", type=Path, default=Path("evaluation"))
+    p.add_argument("--total-targets", type=int, default=100)
+    p.add_argument("--allow-incomplete", action="store_true",
+                   help="Permit incomplete target coverage (HR denominator remains total-targets)")
+    p.add_argument("--strict-duplicates", action="store_true",
+                   help="Fail when the same SMILES has conflicting metric values")
+    p.add_argument("--duplicate-tolerance", type=float, default=1e-6)
+    p.add_argument("--strict-composite", action="store_true",
+                   help="Fail if stored composite disagrees with 0.5*QED-0.5*Vina+0.4*SA")
+    return p.parse_args()
 
-# ========= 代表样本收集（已与最新版逻辑同步） =========
-def collect_representatives(
-    root_dir,
-    *,
-    remove_inactive=False,        # 与最新版对齐，默认不删除
-    baseline_total=1767,          # 与最新版对齐
-    strict=True                   # True=CrossDocked2020严筛；False=可切到“粗筛”
-):
-    """
-    遍历 root_dir 下所有子目录，读取每个子目录的 molecules.csv，
-    先按最新版逻辑进行阈值筛选（strict: vina<-8.18 & qed>0.25 & sa>0.59），
-    在“合格集合”中取 composite 最大的记录作为代表；
-    若不存在合格样本，记为 inactive（可选是否删除该 csv）。
 
-    同时保留“需同步版”的功能：
-    - 记录 PDB_ID
-    - 计算并填充分子描述符（MolWt/LogP/HBD/HBA）
-    - 计算 Lipinski 分数
-    """
-    inactive = 0
-    total = 0
-    reps = []
+def sources(root: Path, task_id: int):
+    tid = str(task_id)
+    return (root / tid / "molecules.csv",
+            root / "cache" / tid / "molecules.csv",
+            root / "cache" / tid / "molecules_pool.csv")
 
-    root_dir = Path(root_dir)
-    need_cols = {"vina", "qed", "sa", "composite"}  # 同步最新版最小必需列
 
-    for sub in root_dir.iterdir():
-        csv_path = sub / "molecules.csv"
-        if not csv_path.is_file():
+def parse_record(row, file: Path, line: int, task_id: int):
+    raw = (row.get("SMILES") or row.get("smiles") or "").strip()
+    if not raw:
+        raise ValueError(f"Missing SMILES at {file}:{line}")
+    mol = Chem.MolFromSmiles(raw)
+    if mol is None or mol.GetNumHeavyAtoms() == 0 or len(Chem.GetMolFrags(mol)) != 1:
+        raise ValueError(f"Invalid/split SMILES at {file}:{line}: {raw}")
+    canonical = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+    values = [(row.get(key) or "").strip() for key in METRICS]
+    if not all(values):
+        return canonical, None  # monitor.py counts the molecule but skips records without metrics
+    try:
+        metrics = dict(zip(METRICS, (float(v) for v in values)))
+    except ValueError as exc:
+        raise ValueError(f"Nonnumeric metrics at {file}:{line}") from exc
+    if not all(math.isfinite(v) for v in metrics.values()):
+        raise ValueError(f"Nonfinite metrics at {file}:{line}")
+    if metrics["vina"] >= 500:  # documented docking failure sentinel
+        return canonical, None
+    hac = mol.GetNumHeavyAtoms()
+    record = dict(task_id=task_id, SMILES=canonical, **metrics,
+                  mol_weight=Descriptors.MolWt(mol), heavy_atom_count=hac,
+                  ligand_efficiency=-metrics["vina"] / hac,
+                  source_file=str(file))
+    return canonical, record
+
+
+def read_target(root, task_id, args, warnings):
+    unique_smiles = set()
+    records = {}
+    files = 0
+    metric_rows = 0
+    conflicts = 0
+    composite_mismatches = 0
+    for file in sources(root, task_id):
+        if not file.is_file():
             continue
-
-        df = parse_molecules_csv(csv_path)
-        if not need_cols.issubset(df.columns):
-            print(f"Skip (missing cols): {sub.name}")
-            continue
-
-        df = df.dropna(subset=list(need_cols))
-
-        # —— 与最新版同步的筛选逻辑 ——
-        if strict:
-            eligible = df[(df["vina"] < -8.18) & (df["qed"] > 0.25) & (df["sa"] > 0.59)]
-        else:
-            # 你在最新版中给过“粗筛”示例，这里保留开关以便切换
-            eligible = df[(df["vina"] < -6) & (df["qed"] > 0.45) & (df["sa"] > 0.4)]
-            # 或者极宽松：eligible = df[(df['vina'] < -1)]
-
-        if not eligible.empty:
-            # 在合格集合中取 composite 最大
-            idx = eligible["composite"].idxmax()
-            row = eligible.loc[idx].copy()
-            row["PDB_ID"] = sub.name  # 保留需同步版功能：记录来源目录为 PDB_ID
-
-            # 计算描述符 & Lipinski（保留需同步版功能）
-            smi_col = "SMILES" if "SMILES" in row.index else None
-            if smi_col and isinstance(row[smi_col], str):
-                desc = compute_descriptors(row[smi_col])
-                if desc:
-                    row["MolWt"] = desc["MolWt"]
-                    row["LogP"] = desc["LogP"]
-                    row["NumHDonors"] = desc["NumHDonors"]
-                    row["NumHAcceptors"] = desc["NumHAcceptors"]
-                    row["Lipinski"] = compute_lipinski_score(desc)
+        files += 1
+        with file.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames or not ({"SMILES", "smiles"} & set(reader.fieldnames)):
+                raise ValueError(f"Missing SMILES column: {file}")
+            for line, row in enumerate(reader, 2):
+                canonical, record = parse_record(row, file, line, task_id)
+                unique_smiles.add(canonical)
+                if record is None:
+                    continue
+                metric_rows += 1
+                expected = 0.5 * record["qed"] - 0.5 * record["vina"] + 0.4 * record["sa"]
+                if abs(record["composite"] - expected) > 1e-3:
+                    composite_mismatches += 1
+                    if args.strict_composite:
+                        raise ValueError(f"Composite mismatch: {file}:{line}, got {record['composite']}, expected {expected}")
+                previous = records.get(canonical)
+                if previous is not None:
+                    differing = any(abs(record[k] - previous[k]) > args.duplicate_tolerance for k in METRICS)
+                    if differing:
+                        conflicts += 1
+                        if args.strict_duplicates:
+                            raise ValueError(f"Conflicting metrics for target {task_id} SMILES {canonical}: "
+                                             f"{previous['source_file']} vs {file}:{line}")
+                    # Same behavior as monitor.py: for repeated SMILES, retain lowest Vina.
+                    if (record["vina"], record["mol_weight"]) < (previous["vina"], previous["mol_weight"]):
+                        records[canonical] = record
                 else:
-                    row["MolWt"] = row["LogP"] = row["NumHDonors"] = row["NumHAcceptors"] = row["Lipinski"] = None
-            else:
-                row["MolWt"] = row["LogP"] = row["NumHDonors"] = row["NumHAcceptors"] = row["Lipinski"] = None
+                    records[canonical] = record
+    if conflicts:
+        warnings.append(f"target {task_id}: {conflicts} conflicting duplicate records; retained lowest Vina per SMILES")
+    if composite_mismatches:
+        warnings.append(f"target {task_id}: {composite_mismatches} rows have composite inconsistent with reported weights")
+    return list(records.values()), dict(task_id=task_id, source_files=files,
+                                        unique_smiles=len(unique_smiles),
+                                        rows_with_metrics=metric_rows,
+                                        unique_evaluated=len(records),
+                                        duplicate_conflicts=conflicts,
+                                        composite_mismatches=composite_mismatches)
 
-            reps.append(row)
 
-        else:
-            # 不存在合格样本 → inactive
-            best = df.loc[df["composite"].idxmax()] if not df.empty else None
-            if best is not None:
-                print(
-                    f"Inactive (no eligible): {sub.name} | best -> "
-                    f"vina={best.get('vina', None)}, qed={best.get('qed', None)}, sa={best.get('sa', None)}"
-                )
-            else:
-                print(f"Inactive (empty df): {sub.name}")
+def choose(records, selection):
+    if not records:
+        return None
+    if selection == "docking":
+        return min(records, key=lambda r: (r["vina"], r["mol_weight"], r["SMILES"]))
+    return max(records, key=lambda r: (r["composite"], -r["mol_weight"], r["SMILES"]))
 
-            inactive += 1
-            if remove_inactive:
-                try:
-                    os.remove(csv_path)
-                except Exception as e:
-                    print(f"Failed to remove {csv_path}: {e}")
 
-        total += 1
+def is_hit(row):
+    return (row["vina"] < THRESHOLDS["vina"] and
+            row["qed"] > THRESHOLDS["qed"] and
+            row["sa"] > THRESHOLDS["sa"])
 
-    active = total - inactive
-    activate_global_rate = (active / baseline_total) if baseline_total else 0.0
-    activate_current_rate = (active / total) if total else 0.0
 
-    print("Total:", total)
-    print("Inactive:", inactive)
-    print("Active:", active)
-    print("Activate global rate:", activate_global_rate)
-    print("Activate current rate:", activate_current_rate)
+def write_csv(path, fieldnames, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
 
-    reps_df = pd.DataFrame(reps).reset_index(drop=True)
-    return reps_df
 
-# ========= 主程序：与需同步版一致地导出两份 CSV =========
+def describe(rows, denominator):
+    summary = {"n_selected": len(rows), "n_hit": sum(r["hit"] for r in rows),
+               "hit_rate_all_targets": sum(r["hit"] for r in rows) / denominator}
+    for field in (*METRICS, "mol_weight", "heavy_atom_count", "ligand_efficiency"):
+        vals = [r[field] for r in rows]
+        summary[field] = {"mean": mean(vals) if vals else None,
+                          "median": median(vals) if vals else None,
+                          "sd": stdev(vals) if len(vals) > 1 else None}
+    return summary
+
+
 def main():
-    file_name = "output_druggen_deepseek_V3_MT_with_insight_opt"
-    root_dir = f"./{file_name}"
+    args = parse_args()
+    if args.total_targets < 1:
+        raise ValueError("--total-targets must be positive")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    warnings = []
+    coverage = []
+    selected = {"composite": [], "docking": []}
+    missing = []
+    for task_id in range(args.total_targets):
+        candidates, counts = read_target(args.root, task_id, args, warnings)
+        coverage.append(counts)
+        if not candidates:
+            missing.append(task_id)
+            continue
+        for selection in selected:
+            row = dict(choose(candidates, selection))
+            row["hit"] = int(is_hit(row))  # AFTER Top-1 selection, never a selection filter
+            selected[selection].append(row)
 
-    # 与最新版对齐：默认不删除 inactive；严格筛选；baseline_total=1767
-    reps_df = collect_representatives(
-        root_dir,
-        remove_inactive=False,
-        baseline_total=1767,
-        strict=True,
-    )
+    for selection, rows in selected.items():
+        write_csv(args.output_dir / f"CrossDocked2020_{selection}_top1.csv", EXPORT_FIELDS, rows)
+    write_csv(args.output_dir / "CrossDocked2020_target_coverage.csv",
+              ("task_id", "source_files", "unique_smiles", "rows_with_metrics",
+               "unique_evaluated", "duplicate_conflicts", "composite_mismatches"), coverage)
+    report = {"total_targets": args.total_targets, "targets_with_evaluable_molecules":
+              args.total_targets - len(missing), "missing_target_ids": missing,
+              "candidate_sources": ["<root>/<id>/molecules.csv", "<root>/cache/<id>/molecules.csv",
+                                    "<root>/cache/<id>/molecules_pool.csv"],
+              "duplicate_policy": "canonical SMILES; lowest Vina for duplicate records (monitor.py)",
+              "selection_policy": "unconditional Top-1; hit applied after selection",
+              "hit_thresholds_strict": THRESHOLDS,
+              "statistics": {selection: describe(rows, args.total_targets) for selection, rows in selected.items()},
+              "warnings": warnings}
+    (args.output_dir / "CrossDocked2020_evaluation_summary.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+    print(json.dumps({"total_targets": report["total_targets"],
+                      "targets_with_evaluable_molecules": report["targets_with_evaluable_molecules"],
+                      "missing_target_ids": missing,
+                      "statistics": report["statistics"], "warning_count": len(warnings)}, indent=2))
+    if warnings:
+        print("[WARNING] See evaluation_summary.json for duplicate/composite discrepancies", file=sys.stderr)
+    if missing and not args.allow_incomplete:
+        print("[ERROR] Incomplete target coverage; output files are provisional. "
+              "Use --allow-incomplete only if explicitly reporting missing targets.", file=sys.stderr)
+        return 2
+    return 0
 
-    # 计算全数据集层面的统计并导出
-    num_df = reps_df.select_dtypes(include="number")
-    stats_overall = num_df.agg(["median", "mean", "min", "max"])
-    print(stats_overall)
-    stats_overall.to_csv(f"{file_name}_report.csv")
-
-    # 导出代表表（包含 PDB_ID、SMILES 以及其他属性）
-    cols = []
-    if "PDB_ID" in reps_df.columns:
-        cols.append("PDB_ID")
-    if "SMILES" in reps_df.columns:
-        cols.append("SMILES")
-
-    # 其余属性列（保持你原来导出的风格）
-    property_cols = [c for c in reps_df.columns if c not in ["PDB_ID", "SMILES"]]
-    cols += property_cols
-
-    reps_df.to_csv(f"{file_name}_representative_table.csv", columns=cols, index=False)
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
